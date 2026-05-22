@@ -32,8 +32,10 @@ function doPost(e) {
     const user = body.user || 'unknown';
     const payload = body.payload || {};
 
-    // Auth check — every write requires a valid user (except auth_check itself)
-    if (action !== 'auth_check' && action !== 'health') {
+    // Auth check — every write requires a valid user (except auth_check itself).
+    // Note: 'read_sheet' is also auth-skipped — it's needed before login to
+    // populate the dashboard cache. It still requires the shared_secret.
+    if (action !== 'auth_check' && action !== 'health' && action !== 'read_sheet') {
       const userRow = findUser(user, body.password_hash);
       if (!userRow) {
         return jsonResponse({ ok: false, error: 'Authentication failed' });
@@ -41,10 +43,25 @@ function doPost(e) {
       if (!userRow.active) {
         return jsonResponse({ ok: false, error: 'User is inactive' });
       }
-      // Permission check: managers can only edit their assigned locations
-      const targetLoc = payload.location || payload.locationKey || '';
-      if (userRow.role === 'manager' && targetLoc) {
-        if (!userRow.locations.includes(targetLoc)) {
+      // Parse locations JSON (stored as JSON string in the sheet).
+      let userLocs = [];
+      try { userLocs = userRow.locations ? JSON.parse(userRow.locations) : []; }
+      catch (e) { userLocs = []; }
+      // Permission check: managers can only edit locations on their list.
+      // Extract the target location from whichever payload shape this action uses.
+      const targetLoc = _extractTargetLocation(action, payload);
+      if (userRow.role === 'manager') {
+        // Managers must have a location list AND target must be on it.
+        // If targetLoc is empty, this is a multi-row or non-location-bound action
+        // (e.g. bulk_write_items can touch multiple locations) — for safety, also
+        // verify every location referenced in such payloads.
+        const allTargetLocs = _extractAllTargetLocations(action, payload);
+        for (const loc of allTargetLocs) {
+          if (loc && !userLocs.includes(loc)) {
+            return jsonResponse({ ok: false, error: 'No permission for location: ' + loc });
+          }
+        }
+        if (targetLoc && !userLocs.includes(targetLoc)) {
           return jsonResponse({ ok: false, error: 'No permission for this location' });
         }
       }
@@ -57,6 +74,7 @@ function doPost(e) {
     switch (action) {
       case 'health':           result = handleHealth(); break;
       case 'auth_check':       result = handleAuthCheck(user, body.password_hash); break;
+      case 'read_sheet':       result = handleReadSheet(payload); break;
       case 'write_item':       result = handleWriteItem(payload, user); break;
       case 'delete_item':      result = handleDeleteItem(payload, user); break;
       case 'bulk_write_items': result = handleBulkWriteItems(payload, user); break;
@@ -78,7 +96,51 @@ function doPost(e) {
   }
 }
 
-// ── Health check (GET) ───────────────────────────────────────────────────────
+// ── Helpers for permission check: extract target location(s) by action shape ──
+// Different actions stash the target location in different parts of the payload.
+// These helpers centralize that knowledge so the doPost permission check works
+// consistently. _extractTargetLocation returns the single primary location (or
+// '' if none); _extractAllTargetLocations returns every location referenced in
+// the payload (for bulk operations).
+function _extractTargetLocation(action, payload) {
+  payload = payload || {};
+  switch (action) {
+    case 'write_item':
+    case 'delete_item':
+      return (payload.item && payload.item.location) || payload.location || '';
+    case 'write_tap':
+    case 'delete_tap':
+      return (payload.tap && payload.tap.location) || payload.location || '';
+    case 'write_board':
+      return (payload.board && payload.board.location) || payload.location || '';
+    case 'write_location':
+      return (payload.location && payload.location.key) || payload.locationKey || '';
+    case 'write_categories':
+    case 'write_image':
+      return payload.location || '';
+    case 'write_cross_promo':
+      return (payload.promo && payload.promo.location) || payload.replaceForLocation || payload.location || '';
+    case 'write_user':
+    case 'bulk_write_items':
+    case 'archive_changelog':
+      return '';  // multi-row or non-location-bound
+    default:
+      return payload.location || '';
+  }
+}
+
+function _extractAllTargetLocations(action, payload) {
+  payload = payload || {};
+  const out = [];
+  if (action === 'bulk_write_items') {
+    (payload.items || []).forEach(i => { if (i.location) out.push(i.location); });
+    (payload.deletions || []).forEach(d => { if (d.location) out.push(d.location); });
+  }
+  // Add other multi-row actions here if needed in future.
+  // Deduplicate.
+  return Array.from(new Set(out));
+}
+
 // Useful for confirming the script is reachable. No auth required.
 function doGet(e) {
   return jsonResponse({
@@ -223,6 +285,57 @@ function handleAuthCheck(emailOrAlias, passwordHash) {
 
 function handleHealth() {
   return { status: 'ok', spreadsheet: SPREADSHEET_ID, time: new Date().toISOString() };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Read handler — lets the dashboard read sheet tabs without needing direct
+// gviz access. This is needed because the spreadsheet is NOT publicly shared;
+// the Apps Script runs as the sheet owner, so it can always read.
+//
+// Requires only the shared_secret (no user auth) — same level of protection
+// as gviz would have had if the sheet were public. The shared_secret is in
+// the dashboard HTML which is publicly hosted, so this is equivalent to a
+// public read but routed through Apps Script so the sheet stays private.
+//
+// Tab allowlist prevents using this endpoint to read arbitrary internal sheets
+// the script might have access to.
+// The `users` tab's password_hash column is redacted before returning.
+// ═══════════════════════════════════════════════════════════════════════════════
+const READABLE_TABS = [
+  'items','locations','categories','taps','boards',
+  'cross_promo','image_library','users','change_log',
+];
+
+function handleReadSheet(payload) {
+  const tab = String(payload.tab || '').trim();
+  if (!tab) throw new Error('read_sheet requires tab name');
+  if (READABLE_TABS.indexOf(tab) === -1) {
+    throw new Error('Tab not readable via API: ' + tab);
+  }
+  const s = sheet(tab);
+  const lastRow = s.getLastRow();
+  const lastCol = s.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return { rows: [], headers: [] };
+  const headers = s.getRange(1, 1, 1, lastCol).getValues()[0];
+  const data = s.getRange(2, 1, lastRow - 1, lastCol).getValues();
+  // Find password_hash column index for redaction (users tab only).
+  const hashColIdx = (tab === 'users') ? headers.indexOf('password_hash') : -1;
+  const rows = data.map(row => {
+    const obj = {};
+    headers.forEach((h, i) => {
+      if (i === hashColIdx) {
+        // Redact: tell the client whether a hash is set, but not what it is.
+        const v = String(row[i] || '');
+        obj[h] = v ? (v === FIRST_LOGIN_SENTINEL ? FIRST_LOGIN_SENTINEL : '(set)') : '';
+      } else {
+        // Coerce Date objects to ISO strings for JSON serialization safety.
+        const v = row[i];
+        obj[h] = (v instanceof Date) ? v.toISOString() : v;
+      }
+    });
+    return obj;
+  });
+  return { rows: rows, headers: headers, count: rows.length };
 }
 
 // Re-fetch user with locations parsed
