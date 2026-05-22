@@ -160,6 +160,12 @@ function findRowByKeys(sheetName, keys) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // User auth
 // ═══════════════════════════════════════════════════════════════════════════════
+// SENTINEL: when a user is first created, password_hash is set to this value.
+// On their first successful auth_check, the real hash they sent is captured and
+// written to the sheet, replacing the sentinel. From then on, only matching the
+// stored hash will authenticate.
+const FIRST_LOGIN_SENTINEL = '<set on first login>';
+
 function findUser(emailOrAlias, passwordHash) {
   if (!emailOrAlias) return null;
   const headers = getHeaders('users');
@@ -177,9 +183,10 @@ function findUser(emailOrAlias, passwordHash) {
     const lookup = String(emailOrAlias).toLowerCase();
     if (email === lookup || alias === lookup) {
       const storedHash = String(row[hashIdx]);
-      // Password hash check — strict match required
-      // Allow "<set on first login>" sentinel for initial setup
-      if (storedHash === '<set on first login>' || storedHash === passwordHash) {
+      // Password hash check — strict match required.
+      // First-login sentinel accepts any password (it will be captured by
+      // handleAuthCheck on the auth_check call); subsequent calls must match.
+      if (storedHash === FIRST_LOGIN_SENTINEL || storedHash === passwordHash) {
         return rowToObject(headers, row);
       }
     }
@@ -190,12 +197,21 @@ function findUser(emailOrAlias, passwordHash) {
 function handleAuthCheck(emailOrAlias, passwordHash) {
   const user = findUser(emailOrAlias, passwordHash);
   if (!user) return { authenticated: false };
-  // Update last_login
   const rowIdx = findRowByKey('users', 'email', user.email);
   if (rowIdx > 0) {
     const headers = getHeaders('users');
+    const hashColIdx = headers.indexOf('password_hash');
     const llIdx = headers.indexOf('last_login');
-    if (llIdx >= 0) sheet('users').getRange(rowIdx, llIdx + 1).setValue(new Date().toISOString());
+    const s = sheet('users');
+    // If the stored hash is still the first-login sentinel, capture the real
+    // hash that was just provided. This locks the password in from here on.
+    if (hashColIdx >= 0 && passwordHash && String(user.password_hash) === FIRST_LOGIN_SENTINEL) {
+      s.getRange(rowIdx, hashColIdx + 1).setValue(passwordHash);
+      try { logChange(user.email || user.alias || 'unknown', '', 'PASSWORD SET', user.email || user.alias || '', 'First-login password captured'); } catch (e) {}
+      user.password_hash = passwordHash;
+    }
+    // Update last_login
+    if (llIdx >= 0) s.getRange(rowIdx, llIdx + 1).setValue(new Date().toISOString());
   }
   // Don't return the password hash
   delete user.password_hash;
@@ -613,7 +629,7 @@ function installArchiveTrigger() {
 //   - Run "installBackupTrigger" once (you'll be prompted to authorize Drive access)
 //   - To test immediately, run "runDailyBackup" manually
 const BACKUP_FOLDER_NAME = 'MSBC Menu Backups';
-const BACKUP_FOLDER_ID = '';  // Paste folder ID here after first run for permanent tracking
+const BACKUP_FOLDER_ID = '1m38RAjE2iYm5vrQnmgiP3rHKXdsIcA_k';  // Paste folder ID here after first run for permanent tracking
 const BACKUP_RETENTION_DAYS = 14;
 
 function runDailyBackup() {
