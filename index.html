@@ -1759,6 +1759,18 @@ function applySheetData(data){
       if (!newT[locKey]) newT[locKey] = [];
       newT[locKey].push(_sheetTapToLocalTap(row));
     });
+    // Preserve local-only taps (added in-browser but not yet pushed to sheet
+    // because they have no name yet). Without this, the background refresh
+    // wipes a row the user is mid-way through filling in.
+    Object.keys(T).forEach(k => {
+      (T[k]||[]).forEach(localTap => {
+        const isLocalOnly = !localTap.name || !String(localTap.name).trim();
+        if (!isLocalOnly) return;
+        if (!newT[k]) newT[k] = [];
+        // Don't duplicate if (somehow) it's already there
+        if (!newT[k].some(t => t.id === localTap.id)) newT[k].push(localTap);
+      });
+    });
     Object.keys(newT).forEach(k => {
       // Sort: current first by sort_order, then upcoming by sort_order
       newT[k].sort((a,b) => {
@@ -1789,6 +1801,11 @@ function _anyEditOpen(){
     // inside the items list area (where startNameEdit etc. inject editors)
     if (el.closest && el.closest('.list')) return true;
   }
+  // Taps tab inputs aren't inside .list — they're always-on inline editors per
+  // row. Treat focus on any tap-field as an active edit so the background
+  // refresh doesn't blow away the user's typing.
+  const ae = document.activeElement;
+  if (ae && ae.classList && ae.classList.contains('tap-field')) return true;
   return false;
 }
 
@@ -2266,6 +2283,8 @@ function renderTaps(area){
         <button class="btn btn-ghost btn-sm" onclick="moveTap('${esc(tap.id)}',1)"${isLast?' disabled':''}>↓</button>
         <button class="btn btn-danger btn-sm" onclick="deleteTap('${esc(tap.id)}')">×</button>
       </div>`:''}
+      <input class="tap-field tap-desc" value="${esc(tap.description||'')}" placeholder="Description (printed on bar menu) — e.g., hop-forward, citrus notes, light body"
+        ${editable?`onchange="editTapField('${esc(tap.id)}','description',this.value)"`:'readonly'}>
     </div>`;
   }
 
@@ -2290,6 +2309,8 @@ function renderTaps(area){
     .tap-field{padding:5px 8px;font-size:12.5px;background:var(--surface2);border:1px solid var(--border2);border-radius:4px;color:var(--text);min-width:0}
     .tap-field:focus{outline:none;border-color:var(--amber)}
     .tap-row-actions{display:flex;gap:4px;flex-shrink:0}
+    .tap-desc{flex:1 1 100%;font-size:11.5px;font-style:italic;color:var(--text-soft, var(--text))}
+    .tap-desc::placeholder{font-style:italic;color:var(--dim)}
   </style>
   <div style="margin-bottom:16px">
     <h3 style="font-family:'Playfair Display',serif;font-size:16px;font-weight:600">🍺 Taps — ${esc(L.name)}</h3>
@@ -2537,15 +2558,23 @@ function _draftsFromTaps(locKey){
     if (t.price_10oz)    sizes.push({ label: '10oz',    price: parseFloat(t.price_10oz)||0 });
     if (t.price_mason)   sizes.push({ label: 'Mason',   price: parseFloat(t.price_mason)||0 });
     if (t.price_pitcher) sizes.push({ label: 'Pitcher', price: parseFloat(t.price_pitcher)||0 });
-    // Style + ABV + brewery as the descriptive text
+    // Style + ABV + brewery on first line, user description on second line if present.
     const descParts = [];
     if (t.style) descParts.push(t.style);
     if (t.abv) descParts.push(t.abv + '%');
     if (t.brewery) descParts.push(t.brewery);
+    const techDesc = descParts.join(' · ');
+    // Combine into final desc: tech line, then user description on its own visual line.
+    let fullDesc = techDesc;
+    if (t.description && t.description.trim()) {
+      fullDesc = techDesc
+        ? (techDesc + '\n' + t.description.trim())
+        : t.description.trim();
+    }
     return {
       id: t.id,
       name: t.name || '',
-      desc: descParts.join(' · '),
+      desc: fullDesc,
       cat: 'Draft Beer',
       menu: 'bar',
       sizes: sizes,
@@ -2760,20 +2789,23 @@ function printBarSpecials(){
   function h(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 
   // item row — price=0 or blank = amber callout banner (text-only note)
+  // desc may contain '\n' for multi-line (e.g., tap descriptions: tech-line then prose)
   function irow(item){
     var name=item.name,price=item.price,desc=item.desc;
     var icons=(item.gf?'<span style="font-size:5.5pt;font-weight:700;color:#3a9a5c;margin-left:2pt;vertical-align:middle">GF</span>':'')
              +(item.nut?'<span style="font-size:6pt;margin-left:2pt;vertical-align:middle">&#x1F95C;</span>':'');
+    // Render desc preserving line breaks (\n → <br>) after escaping HTML
+    var descHTML = desc ? h(desc).replace(/\n/g, '<br>') : '';
     if(!price||Number(price)===0||price===''){
       return '<div style="margin-bottom:2pt;line-height:1.3">'
         +'<span style="font-weight:700;font-size:8.5pt">'+h(name)+'</span>'
-        +(desc?'<span style="font-size:7pt;color:#333"> — '+h(desc)+'</span>':'')
+        +(descHTML?'<span style="font-size:7pt;color:#333"> — '+descHTML+'</span>':'')
         +'</div>';
     }
     return '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:3pt;margin-bottom:1.5pt">'
       +'<div style="flex:1;min-width:0">'
       +'<div style="font-weight:700;font-size:7.5pt;line-height:1.2">'+h(name)+icons+'</div>'
-      +(desc?'<div style="font-size:6.5pt;color:#333;line-height:1.3;margin-top:1pt">'+h(desc)+'</div>':'')
+      +(descHTML?'<div style="font-size:6.5pt;color:#333;line-height:1.3;margin-top:1pt">'+descHTML+'</div>':'')
       +'</div>'
       +'<div style="font-weight:700;font-size:7.5pt;white-space:nowrap;margin-left:5pt">$'+Number(price).toFixed(2)+'</div>'
       +'</div>';
@@ -2810,33 +2842,33 @@ function printBarSpecials(){
     var n=String(name||'').toLowerCase();
     return n.indexOf('draft')!==-1 || n.indexOf('on tap')!==-1;
   }
-  var allBarCats=getCats('bar');
-  var barHTML='';
-  allBarCats.forEach(function(c){
-    if(!_isCatOnMenu(loc, 'bar', c)) return;
-    var ci;
-    if(isDraftCat(c) && tapBackedDrafts){
-      ci=tapBackedDrafts;
-    } else {
-      ci=items.filter(function(i){return i.menu==='bar'&&i.cat===c&&!i.seasonal;});
-    }
-    if(!ci.length)return;
-    barHTML+=sec(c);
-    ci.forEach(function(i){barHTML+=irow(i);});
-  });
-  barHTML+='<div style="margin-top:8pt;text-align:center;font-weight:600;font-size:7pt">We proudly serve spirits — ask your server!</div>';
 
   // ── SPECIALS content — single column ─────────────────────────────────────
   var specItems=items.filter(function(i){return i.menu==='food'&&i.cat==='Specials';});
   var seasItems=items.filter(function(i){return i.menu==='bar'&&i.cat==='Seasonal Cocktails';});
 
+  // Specials card content. Order: Drafts (with descriptions) → Food & Drink Specials → Seasonal Cocktails.
+  // Drafts moved here from the Bar card so each tap can include its full description without
+  // overcrowding the bar-bottle-wine layout on the other card.
   var specHTML='';
+  // Drafts first (tap-backed if available, otherwise fall back to items in draft categories)
+  if (tapBackedDrafts && tapBackedDrafts.length) {
+    specHTML += sec('On Draft');
+    tapBackedDrafts.forEach(function(t){specHTML += irow(t);});
+  } else {
+    // No taps configured — pull items from any draft-named category
+    var draftCats = getCats('bar').filter(isDraftCat);
+    draftCats.forEach(function(c){
+      if (!_isCatOnMenu(loc, 'bar', c)) return;
+      var ci = items.filter(function(i){return i.menu==='bar'&&i.cat===c&&!i.seasonal;});
+      if (!ci.length) return;
+      specHTML += sec(c);
+      ci.forEach(function(i){specHTML += irow(i);});
+    });
+  }
   if(specItems.length && _isCatOnMenu(loc, 'food', 'Specials')){
     specHTML+=sec('Food & Drink Specials');
     specItems.forEach(function(i){specHTML+=irow(i);});
-  } else {
-    specHTML+='<div style="text-align:center;color:#aaa;font-size:8pt;padding:16pt 0;font-style:italic">'
-      +'No specials added yet.<br>Add items to the "Specials" category.</div>';
   }
   if(seasItems.length && _isCatOnMenu(loc, 'bar', 'Seasonal Cocktails')){
     specHTML+=sec('Seasonal Cocktails');
@@ -2848,8 +2880,8 @@ function printBarSpecials(){
   //                     Page 2 = Specials(left) | Bar(right)  <- flipped for cut alignment
   // Cut vertically down center -> each piece has Bar on one side, Specials on other.
 
-  // Bar menu: exclude Seasonal Cocktails (those go on Specials side)
-  var barCatsFiltered=getCats('bar').filter(function(c){return c!=='Seasonal Cocktails';});
+  // Bar menu: exclude Seasonal Cocktails AND draft categories (those go on Specials side)
+  var barCatsFiltered=getCats('bar').filter(function(c){return c!=='Seasonal Cocktails' && !isDraftCat(c);});
   var barHTMLfinal='';
   barCatsFiltered.forEach(function(c){
     if(!_isCatOnMenu(loc, 'bar', c)) return;
