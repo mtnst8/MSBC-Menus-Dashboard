@@ -519,14 +519,19 @@ function handleWriteCategories(payload, user) {
 function handleWriteTap(payload, user) {
   const tap = payload.tap;
   if (!tap || !tap.location || !tap.name) throw new Error('write_tap requires tap.location and tap.name');
+  // Ensure the taps sheet has all columns the dashboard expects. Adds any
+  // missing columns to the end without disturbing existing data. Safe to
+  // call on every write — it's a no-op if all columns are present.
+  _ensureTapsSchema();
   const headers = getHeaders('taps');
   tap.updated_at = new Date().toISOString();
   tap.updated_by = user;
-  // Use composite key (location, name, status) unless tap.id is provided
+  // Use id if present, else composite key (location, name, status)
   let rowIdx = -1;
-  if (tap.id) {
+  if (tap.id && headers.indexOf('id') !== -1) {
     rowIdx = findRowByKey('taps', 'id', tap.id);
-  } else {
+  }
+  if (rowIdx === -1) {
     rowIdx = findRowByKeys('taps', { location: tap.location, name: tap.name, status: tap.status || 'current' });
   }
   const rowValues = objectToRow(headers, tap);
@@ -538,6 +543,19 @@ function handleWriteTap(payload, user) {
     logChange(user, tap.location, 'TAP UPDATED', tap.name, payload.diff || '');
   }
   return { written: true };
+}
+
+// Ensure the taps sheet has every column the dashboard might write. Adds any
+// missing column to the right edge without touching existing data. Idempotent.
+function _ensureTapsSchema() {
+  const required = ['location','id','tap_number','status','sort_order','name','style','abv','brewery','description','eta','eta_note','tap_image_key','price_10oz','price_mason','price_pitcher','updated_at','updated_by'];
+  const s = sheet('taps');
+  const headers = getHeaders('taps');
+  const missing = required.filter(c => headers.indexOf(c) === -1);
+  if (!missing.length) return;
+  // Append missing columns to the right. Width grows by missing.length.
+  const startCol = headers.length + 1;
+  s.getRange(1, startCol, 1, missing.length).setValues([missing]);
 }
 
 function handleDeleteTap(payload, user) {
